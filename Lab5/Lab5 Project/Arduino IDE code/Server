@@ -1,0 +1,139 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+ 
+#define TRIG_PIN D4 // HC-SR04 Trigger Pin
+#define ECHO_PIN D5 // HC-SR04 Echo Pin
+#define NUM_SAMPLES 5  // Number of samples for moving average filter
+ 
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+unsigned long previousMillis = 0;
+const long interval = 1000;
+ 
+// Change these to your own generated UUIDs
+#define SERVICE_UUID        "f1cdd5ff-705e-4db8-97a4-81e9f7aa2af1"
+#define CHARACTERISTIC_UUID "22a26494-e5ef-4b30-9542-da5b9ed7017b"
+ 
+// Moving average filter buffer
+float distanceBuffer[NUM_SAMPLES] = {0};
+int bufferIndex = 0;
+ 
+class MyServerCallbacks : public BLEServerCallbacks {
+   void onConnect(BLEServer* pServer) {
+       deviceConnected = true;
+       Serial.println("Device Connected!");
+   }
+ 
+   void onDisconnect(BLEServer* pServer) {
+       deviceConnected = false;
+       Serial.println("Device Disconnected!");
+       delay(500);  // Allow the stack to stabilize
+       pServer->startAdvertising(); // Restart advertising
+   }
+};
+ 
+void setup() {
+   Serial.begin(115200);
+   delay(500);  // Allow time for the Serial Monitor to connect
+   Serial.println("Starting BLE work!");
+ 
+   pinMode(TRIG_PIN, OUTPUT);
+   pinMode(ECHO_PIN, INPUT);
+ 
+   // Initialize BLE
+   BLEDevice::init("XIAO_ESP32S3");
+   pServer = BLEDevice::createServer();
+   pServer->setCallbacks(new MyServerCallbacks());
+ 
+   BLEService *pService = pServer->createService(SERVICE_UUID);
+   pCharacteristic = pService->createCharacteristic(
+       CHARACTERISTIC_UUID,
+       BLECharacteristic::PROPERTY_READ |
+       BLECharacteristic::PROPERTY_WRITE |
+       BLECharacteristic::PROPERTY_NOTIFY
+   );
+   pCharacteristic->addDescriptor(new BLE2902());
+   pCharacteristic->setValue("Waiting for sensor data");
+ 
+   pService->start();
+ 
+   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+   pAdvertising->addServiceUUID(SERVICE_UUID);
+   pAdvertising->setScanResponse(true);
+   pAdvertising->setMinPreferred(0x06);
+   pAdvertising->setMinPreferred(0x12);
+   BLEDevice::startAdvertising();
+ 
+   Serial.println("BLE Device Ready! Waiting for connection...");
+}
+ 
+// Function to read distance from HC-SR04
+float readDistance() {
+   digitalWrite(TRIG_PIN, LOW);
+   delayMicroseconds(2);
+   digitalWrite(TRIG_PIN, HIGH);
+   delayMicroseconds(10);
+   digitalWrite(TRIG_PIN, LOW);
+   long duration = pulseIn(ECHO_PIN, HIGH);
+   float distance = (duration * 0.0343) / 2; // Convert to cm
+   return distance;
+}
+ 
+// Moving Average Filter
+float movingAverage(float newValue) {
+   distanceBuffer[bufferIndex] = newValue; // Store new value
+   bufferIndex = (bufferIndex + 1) % NUM_SAMPLES; // Move index
+ 
+   float sum = 0;
+   for (int i = 0; i < NUM_SAMPLES; i++) {
+       sum += distanceBuffer[i];
+   }
+   return sum / NUM_SAMPLES; // Return average
+}
+ 
+void loop() {
+   unsigned long currentMillis = millis();
+ 
+   // Read sensor data
+   float rawDistance = readDistance();
+   float filteredDistance = movingAverage(rawDistance);
+ 
+   // Print both raw and filtered values
+   Serial.print("Raw Distance: ");
+   Serial.print(rawDistance);
+   Serial.print(" cm | Filtered Distance: ");
+   Serial.print(filteredDistance);
+   Serial.println(" cm");
+ 
+   // Only send data if a device is connected AND distance < 30 cm
+   if (deviceConnected && filteredDistance < 30.0) {
+       if (currentMillis - previousMillis >= interval) {
+           previousMillis = currentMillis;
+          
+           String value = "Raw Data: " + String(rawDistance) + " cm |" + "Filtered Distance: " + String(filteredDistance) + " cm";
+           pCharacteristic->setValue(value.c_str());
+           pCharacteristic->notify();
+           Serial.println("Sent over BLE: " + value);
+       }
+   }
+ 
+   // Handle reconnection logic
+   if (!deviceConnected && oldDeviceConnected) {
+       Serial.println("Restarting advertising...");
+       delay(1000);
+       pServer->startAdvertising();
+       oldDeviceConnected = deviceConnected;
+   }
+  
+   if (deviceConnected && !oldDeviceConnected) {
+       Serial.println("Device reconnected!");
+       oldDeviceConnected = deviceConnected;
+   }
+ 
+   delay(200);  // Prevent CPU overload
+}

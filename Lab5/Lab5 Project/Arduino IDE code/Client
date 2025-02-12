@@ -1,0 +1,219 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+// The remote service/characteristic we wish to connect to.
+static BLEUUID serviceUUID("f1cdd5ff-705e-4db8-97a4-81e9f7aa2af1");
+static BLEUUID charUUID("22a26494-e5ef-4b30-9542-da5b9ed7017b");
+
+// Global variables for connection and notifications
+static boolean doConnect = false;
+static boolean connected = false;
+static boolean doScan = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+static BLEAdvertisedDevice* myDevice = nullptr;
+
+// Global variables to track distance measurements
+float g_currentDistance = 0.0;
+float g_maxDistance = 0.0;
+float g_minDistance = 0.0;
+bool g_firstMeasurement = true;  // used to initialize min and max with first received value
+
+/**
+ * notifyCallback
+ *
+ * This callback is triggered each time the server sends a new notification.
+ * It converts the received data into a string, parses the filtered distance,
+ * updates the global max/min values, and prints the current, maximum, and minimum values.
+ */
+static void notifyCallback(
+    BLERemoteCharacteristic* pBLERemoteCharacteristic,
+    uint8_t* pData,
+    size_t length,
+    bool isNotify
+) {
+  // Convert the received data to an Arduino String.
+  String receivedData = "";
+  for (size_t i = 0; i < length; i++) {
+    receivedData += (char)pData[i];
+  }
+  
+  // For debugging: print the raw received string
+  Serial.print("Received raw data: ");
+  Serial.println(receivedData);
+
+  // Look for the "Filtered Distance:" label in the string.
+  int index = receivedData.indexOf("Filtered Distance:");
+  if (index != -1) {
+    // Find the colon that follows the label.
+    int colonIndex = receivedData.indexOf(":", index);
+    if (colonIndex != -1) {
+      colonIndex++; // Move past the colon
+      // Find the "cm" substring after the number.
+      int cmIndex = receivedData.indexOf("cm", colonIndex);
+      if (cmIndex != -1) {
+        // Extract and trim the substring that should contain the numeric value.
+        String valueStr = receivedData.substring(colonIndex, cmIndex);
+        valueStr.trim();
+        // Convert the extracted string to a float.
+        float distance = valueStr.toFloat();
+        g_currentDistance = distance;
+        
+        // Update the maximum and minimum distances.
+        if (g_firstMeasurement) {
+          g_maxDistance = distance;
+          g_minDistance = distance;
+          g_firstMeasurement = false;
+        } else {
+          if (distance > g_maxDistance) {
+            g_maxDistance = distance;
+          }
+          if (distance < g_minDistance) {
+            g_minDistance = distance;
+          }
+        }
+        
+        // Print the current, maximum, and minimum distance data.
+        Serial.print("Current distance: ");
+        Serial.print(g_currentDistance, 2);
+        Serial.print(" cm, Max distance: ");
+        Serial.print(g_maxDistance, 2);
+        Serial.print(" cm, Min distance: ");
+        Serial.print(g_minDistance, 2);
+        Serial.println(" cm");
+      } else {
+        Serial.println("Error: 'cm' not found in the received data.");
+      }
+    } else {
+      Serial.println("Error: ':' not found after 'Filtered Distance:'");
+    }
+  } else {
+    Serial.println("Error: 'Filtered Distance:' not found in received data.");
+  }
+}
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    // Optionally handle onConnect events here
+  }
+  void onDisconnect(BLEClient* pclient) {
+    connected = false;
+    Serial.println("onDisconnect");
+  }
+};
+
+bool connectToServer() {
+  Serial.print("Forming a connection to ");
+  Serial.println(myDevice->getAddress().toString().c_str());
+
+  BLEClient* pClient = BLEDevice::createClient();
+  Serial.println(" - Created client");
+
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  // Connect to the remote BLE Server.
+  pClient->connect(myDevice);
+  Serial.println(" - Connected to server");
+  pClient->setMTU(517); // Request maximum MTU from server
+
+  // Obtain a reference to the service we are after.
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (pRemoteService == nullptr) {
+    Serial.print("Failed to find our service UUID: ");
+    Serial.println(serviceUUID.toString().c_str());
+    pClient->disconnect();
+    return false;
+  }
+  Serial.println(" - Found our service");
+
+  // Obtain a reference to the characteristic in the service.
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (pRemoteCharacteristic == nullptr) {
+    Serial.print("Failed to find our characteristic UUID: ");
+    Serial.println(charUUID.toString().c_str());
+    pClient->disconnect();
+    return false;
+  }
+  Serial.println(" - Found our characteristic");
+
+  // Read the value of the characteristic if possible.
+  if (pRemoteCharacteristic->canRead()) {
+    String value = pRemoteCharacteristic->readValue();
+    Serial.print("The characteristic value was: ");
+    Serial.println(value);
+  }
+
+  // If this characteristic can notify, register our notification callback.
+  if (pRemoteCharacteristic->canNotify()) {
+    pRemoteCharacteristic->registerForNotify(notifyCallback);
+  }
+
+  connected = true;
+  return true;
+}
+
+/**
+ * MyAdvertisedDeviceCallbacks
+ *
+ * Scans for BLE servers and finds the first one that advertises the service we want.
+ */
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    Serial.print("BLE Advertised Device found: ");
+    Serial.println(advertisedDevice.toString().c_str());
+
+    if (advertisedDevice.haveServiceUUID() && 
+        advertisedDevice.isAdvertisingService(serviceUUID)) {
+
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = true;
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Arduino BLE Client application...");
+
+  BLEDevice::init("");
+
+  // Retrieve a Scanner and set the callback.
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+
+  // Start scanning for 5 seconds.
+  pBLEScan->start(5, false);
+}
+
+void loop() {
+  // Attempt to connect once a device advertising our service is found.
+  if (doConnect) {
+    if (connectToServer()) {
+      Serial.println("We are now connected to the BLE Server.");
+    } else {
+      Serial.println("We failed to connect to the server; nothing more we will do.");
+    }
+    doConnect = false;
+  }
+
+  // If we’re connected, periodically write a new value (this example writes the uptime).
+  if (connected) {
+    String newValue = "Time since boot: " + String(millis() / 1000);
+    Serial.println("Setting new characteristic value to: " + newValue);
+
+    // Write newValue to the characteristic.
+    pRemoteCharacteristic->writeValue(newValue.c_str(), newValue.length());
+  } else if (doScan) {
+    // Continue scanning if disconnected.
+    BLEDevice::getScan()->start(0);  // 0 means scan indefinitely.
+  }
+
+  delay(1000);
+}
